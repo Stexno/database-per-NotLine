@@ -91,7 +91,7 @@ Script di integrazione e correlazione tra database ntopng e Zeek.
 **Fase 1 — Base ntopng**
 
 - lettura tabella `hosts`
-- creazione tabella `interesse`
+- creazione tabella `Interesse`
 - chiave primaria su IP
 - indici su IP e MAC
 
