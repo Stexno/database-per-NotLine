@@ -123,7 +123,7 @@ Per ogni host vengono memorizzati:
 
 ## Schema Database Resultante
 
-### Tabella `interesse`
+### Tabella `Interesse`
 
 Contiene:
 
