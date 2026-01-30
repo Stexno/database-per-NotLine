@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+import os
+import time
+import json
+import sqlite3
+from dateutil import parser
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from datetime import datetime
+
+# -------------------------
+# CONFIGURAZIONE
+# -------------------------
+ZEEK_LOG_DIR = "/percorso/dei/file/di/log/generati/da/zeek/"
+DB_PATH = "/percorso/database/zeek.db"
+POLL_DELAY = 1
+
+# -------------------------
+# FUNZIONI UTILI
+# -------------------------
+def normalize_field_name(name):
+    return name.replace(".", "_").replace("-", "_")
+
+def convert_value(val):
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return str(val)
+    if isinstance(val, (int, float)):
+        return val
+    if isinstance(val, str):
+        if val.strip() == "" or val == "-":
+            return None
+        return val
+    if isinstance(val, datetime):
+        return val.isoformat()
+
+    try:
+        return parser.parse(str(val)).isoformat()
+    except:
+        return str(val)
+
+def create_table_if_not_exists(cursor, table_name, columns):
+    if not columns:
+        return
+
+    column_defs = [f'"{normalize_field_name(c)}" TEXT' for c in columns]
+
+    cursor.execute(f"""
+        CREATE TABLE IF NOT EXISTS "{table_name}" (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            {", ".join(column_defs)}
+        );
+    """)
+
+# -------------------------
+# FIX: CREAZIONE TAB file_offsets
+# -------------------------
+def init_offset_table():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS file_offsets (
+            filename TEXT PRIMARY KEY,
+            last_line INTEGER
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_last_offset(cursor, filename):
+    cursor.execute("SELECT last_line FROM file_offsets WHERE filename = ?", (filename,))
+    row = cursor.fetchone()
+    return row[0] if row else 0
+
+def update_offset(cursor, filename, last_line):
+    cursor.execute("""
+        INSERT INTO file_offsets (filename, last_line)
+        VALUES (?, ?)
+        ON CONFLICT(filename) DO UPDATE SET last_line=excluded.last_line
+    """, (filename, last_line))
+
+def insert_single_row(cursor, table_name, data):
+    data = {normalize_field_name(k): convert_value(v) for k, v in data.items()}
+
+    cursor.execute(f"PRAGMA table_info('{table_name}')")
+    db_columns = [row[1] for row in cursor.fetchall() if row[1] != "id"]
+
+    for col in data.keys():
+        if col not in db_columns:
+            cursor.execute(f'ALTER TABLE "{table_name}" ADD COLUMN "{col}" TEXT')
+            db_columns.append(col)
+
+    row_values = {col: data.get(col) for col in db_columns}
+    col_list = ", ".join([f'"{c}"' for c in db_columns])
+    placeholders = ", ".join(["?"] * len(db_columns))
+    values = [row_values[c] for c in db_columns]
+
+    #print("\n[DEBUG] INSERT in tabella:", table_name)
+    for c, v in zip(db_columns, values):
+        print(f"  {c}: {v}")
+
+    try:
+        cursor.execute(f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders})', values)
+    except Exception as e:
+        print(f"[ERROR] INSERT fallito: {e}")
+
+# -------------------------
+# HANDLER WATCHDOG
+# -------------------------
+class ZeekLogHandler(FileSystemEventHandler):
+    def __init__(self, db_path):
+        self.db_path = db_path
+
+    def on_modified(self, event):
+        if event.src_path.endswith(".log"):
+            self.import_file(event.src_path)
+
+    def import_file(self, filepath):
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        log_file = os.path.basename(filepath)
+        table_name = log_file.replace(".log", "")
+
+        last_offset = get_last_offset(cursor, log_file)
+        current_line = 0
+
+        with open(filepath, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                current_line += 1
+                if current_line <= last_offset:
+                    continue
+
+                try:
+                    data = json.loads(line)
+                except:
+                    continue
+
+                if current_line == last_offset + 1:
+                    create_table_if_not_exists(cursor, table_name, list(data.keys()))
+                    conn.commit()
+
+                insert_single_row(cursor, table_name, data)
+
+        update_offset(cursor, log_file, current_line)
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+# -------------------------
+# SCRIPT PRINCIPALE
+# -------------------------
+def monitor_zeek_logs():
+    event_handler = ZeekLogHandler(DB_PATH)
+    observer = Observer()
+    observer.schedule(event_handler, ZEEK_LOG_DIR, recursive=False)
+
+    observer.start()
+
+    print(f"[✓] Monitoraggio directory {ZEEK_LOG_DIR} avviato. Ctrl+C per terminare.")
+
+    try:
+        while True:
+            time.sleep(POLL_DELAY)
+    except KeyboardInterrupt:
+        observer.stop()
+
+    observer.join()
+    print("[✓] Monitoraggio terminato.")
+
+if __name__ == "__main__":
+    init_offset_table()   
+    monitor_zeek_logs()
