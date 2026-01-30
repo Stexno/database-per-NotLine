@@ -11,8 +11,8 @@ from datetime import datetime
 # -------------------------
 # CONFIGURAZIONE
 # -------------------------
-ZEEK_LOG_DIR = "/percorso/dei/file/di/log/generati/da/zeek/"
-DB_PATH = "/percorso/database/zeek.db"
+ZEEK_LOG_DIR = "/path/zeek/logs/"
+DB_PATH = "/path/zeek.db"
 POLL_DELAY = 1
 
 # -------------------------
