@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+import sqlite3
+import os
+import re
+import json
+
+DB_NTOP = "percorso/database/ntopng.db"
+DB_ZEEK = "percorso/database/zeek.db"
+DB_MERGED = "percorso/database/di/creazione/di/merge.db"
+
+# -------------------- Helpers --------------------
+def safe_colname(name: str) -> str:
+    if name is None:
+        return name
+    s = re.sub(r'[^0-9A-Za-z_]', '_', name.strip())
+    return s or "_col"
+
+def get_tables(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    return [r[0] for r in cur.fetchall()]
+
+def get_columns(conn, table):
+    cur = conn.cursor()
+    cur.execute(f'PRAGMA table_info("{table}")')
+    return [(r[1], r[2]) for r in cur.fetchall()]
+
+def table_exists(conn, table):
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+    return cur.fetchone() is not None
+# -------------------- Copy Tables --------------------
+def copy_table_structure(conn_from, conn_to, table):
+    if table == "sqlite_sequence":
+        return
+    cols = get_columns(conn_from, table)
+    if not cols:
+        return
+    col_defs = ", ".join(f'"{safe_colname(c)}" {t if t else "TEXT"}' for c, t in cols)
+    conn_to.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({col_defs})')
+
+def copy_table_data(conn_from, conn_to, table):
+    if table == "sqlite_sequence":
+        return
+    cur_from = conn_from.cursor()
+    cur_to = conn_to.cursor()
+    try:
+        cur_from.execute(f'SELECT * FROM "{table}"')
+    except sqlite3.OperationalError:
+        return
+    first = cur_from.fetchone()
+    if not first:
+        return
+    placeholders = ", ".join("?" * len(first))
+    conn_to.execute("BEGIN")
+    cur_to.execute(f'INSERT INTO "{table}" VALUES ({placeholders})', first)
+    for row in cur_from:
+        cur_to.execute(f'INSERT INTO "{table}" VALUES ({placeholders})', row)
+    conn_to.commit()
+
+# -------------------- SQLite Tuning --------------------
+def optimize_sqlite(conn):
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-200000")  # ~200MB
+
+# -------------------- NTOP --------------------
+def build_interesse_table(conn_ntop, conn_merged):
+    if not table_exists(conn_ntop, "hosts"):
+        raise RuntimeError("hosts table not found in NTOP DB")
+    cols = get_columns(conn_ntop, "hosts")
+    orig_to_sanit = {c: safe_colname(c) for c, _ in cols}
+    col_defs = []
+    for orig, ctype in cols:
+        cname = orig_to_sanit[orig]
+        if orig == "ip":
+            col_defs.append(f'"{cname}" TEXT PRIMARY KEY')
+        else:
+            col_defs.append(f'"{cname}" {ctype if ctype else "TEXT"}')
+    conn_merged.execute(f'CREATE TABLE IF NOT EXISTS interesse ({", ".join(col_defs)})')
+    # Indici
+    conn_merged.execute('CREATE INDEX IF NOT EXISTS idx_interesse_ip ON interesse(ip)')
+    conn_merged.execute('CREATE INDEX IF NOT EXISTS idx_interesse_mac ON interesse("mac_address")')
+
+    cur_from = conn_ntop.cursor()
+    cur_from.execute('SELECT * FROM hosts')
+    colnames = [orig_to_sanit[c] for c, _ in cols]
+    cols_sql = ", ".join(f'"{c}"' for c in colnames)
+    placeholders = ", ".join("?" * len(colnames))
+
+    conn_merged.execute("BEGIN")
+    count = 0
+    for row in cur_from:
+        conn_merged.execute(f'INSERT OR REPLACE INTO interesse ({cols_sql}) VALUES ({placeholders})', row)
+        count += 1
+        if count % 500 == 0:
+            print(f"[DEBUG] Inserite {count} righe hosts...")
+    conn_merged.commit()
+    print(f"[DEBUG] Totale righe hosts inserite: {count}")
+
+def ensure_columns_bulk(conn, table, columns):
+    cur = conn.cursor()
+    cur.execute(f'PRAGMA table_info("{table}")')
+    existing = {r[1] for r in cur.fetchall()}
+    for col in columns:
+        col_clean = safe_colname(col)
+        if col_clean not in existing:
+            cur.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col_clean}" TEXT')
+
+def process_ntop(conn_ntop, conn_merged):
+    tables = [t for t in get_tables(conn_ntop) if t not in ("hosts", "sqlite_sequence")]
+    for table in tables:
+        print(f"[NTOP] Processing table: {table}")
+        cols = get_columns(conn_ntop, table)
+        col_names = [c for c, _ in cols]
+        cur_from = conn_ntop.cursor()
+        try:
+            cur_from.execute(f'SELECT * FROM "{table}"')
+        except sqlite3.OperationalError:
+            continue
+        if "ip" not in col_names:
+            copy_table_structure(conn_ntop, conn_merged, table)
+            copy_table_data(conn_ntop, conn_merged, table)
+            continue
+        ensure_columns_bulk(conn_merged, "interesse", col_names)
+        ip_col = safe_colname("ip")
+        conn_merged.execute("BEGIN")
+        count = 0
+        for row in cur_from:
+            row_dict = dict(zip(col_names, row))
+            ip = row_dict.get("ip")
+            if not ip:
+                continue
+            set_clause = [f'"{safe_colname(k)}"=?' for k in row_dict.keys()]
+            values = list(row_dict.values())
+            values.append(ip)
+            conn_merged.execute(f'UPDATE interesse SET {", ".join(set_clause)} WHERE "{ip_col}"=?', values)
+            count += 1
+            if count % 100 == 0:
+                print(f"[DEBUG] NTOP {table}: aggiornate {count} righe...")
+                conn_merged.commit()
+        conn_merged.commit()
+        print(f"[DEBUG] NTOP {table}: totale righe aggiornate: {count}")
+
+# -------------------- Zeek --------------------
+def process_zeek(conn_merged, conn_zeek):
+    # Assicura che le colonne esistano in interesse
+    ensure_columns_bulk(conn_merged, "interesse", ["zeek_uid_list", "zeek_json"])
+    cur_merged = conn_merged.cursor()
+
+    zeek_tables = get_tables(conn_zeek)
+    for table in zeek_tables:
+        if table == "sqlite_sequence":
+            continue
+
+        cols = [c for c, _ in get_columns(conn_zeek, table)]
+        has_uid = "uid" in cols
+        has_uids = "uids" in cols
+
+        cur_zeek = conn_zeek.cursor()
+        cur_zeek.execute(f'SELECT * FROM "{table}"')
+        colnames = [d[0] for d in cur_zeek.description]
+
+        # Tabelle senza UID/UIDS → copialo tutto
+        if not (has_uid or has_uids):
+            print(f"[ZEEK] Copiando intera tabella {table} (no uid/uids)")
+            copy_table_structure(conn_zeek, conn_merged, table)
+            copy_table_data(conn_zeek, conn_merged, table)
+            continue
+
+        # ---------------- Tabella conn ----------------
+        if table == "conn":
+            print(f"[ZEEK] Elaborando tabella conn")
+
+            # -------------------------------
+            # Creazione tabella no_inser_zeek (UNA SOLA VOLTA)
+            # -------------------------------
+            if not table_exists(conn_merged, "no_inser_zeek"):
+                base_cols = ["uid", "ip", "mac"]
+                extra_cols = [safe_colname(k) for k in colnames if k not in base_cols]
+                all_cols = base_cols + extra_cols
+                col_defs = ", ".join(f'"{c}" TEXT' for c in all_cols)
+                conn_merged.execute(f'CREATE TABLE no_inser_zeek ({col_defs})')
+
+            # -------------------------------
+            # TRANSAZIONE UNICA
+            # -------------------------------
+            conn_merged.execute("BEGIN")
+
+            processed = 0
+
+            for row in cur_zeek:
+                row_dict = dict(zip(colnames, row))
+
+                ip = row_dict.get("id_orig_h")
+                mac_raw = row_dict.get("orig_l2_addr")
+                mac = mac_raw.upper() if mac_raw else None  
+                uid = row_dict.get("uid")
+
+                matched = False
+
+                # -------------------------------
+                # MATCH SU interesse
+                # -------------------------------
+                if mac:
+                    cur_merged.execute(
+                        """
+                        SELECT zeek_uid_list, zeek_json
+                        FROM interesse
+                        WHERE ip = ? AND mac_address = ?
+                        """,
+                        (ip, mac)
+                    )
+                    r = cur_merged.fetchone()
+
+                    if r:
+                        zeek_uid_list_json, zeek_json_str = r
+
+                        uid_list = json.loads(zeek_uid_list_json) if zeek_uid_list_json else []
+                        if uid not in uid_list:
+                            uid_list.append(uid)
+
+                        zeek_json_obj = json.loads(zeek_json_str) if zeek_json_str else {}
+                        zeek_json_obj[uid] = row_dict
+
+                        cur_merged.execute(
+                            """
+                            UPDATE interesse
+                            SET zeek_uid_list = ?, zeek_json = ?
+                            WHERE ip = ? AND mac_address = ?
+                            """,
+                            (
+                                json.dumps(uid_list),
+                                json.dumps(zeek_json_obj, ensure_ascii=False),
+                                ip,
+                                mac
+                            )
+                        )
+
+                        matched = True
+
+                # -------------------------------
+                # INSERT no_inser_zeek
+                # -------------------------------
+                if not matched:
+                    insert_cols = ["uid", "ip", "mac"] + [safe_colname(k) for k in row_dict.keys()]
+                    placeholders = ", ".join("?" * len(insert_cols))
+                    values = [uid, ip, mac] + [str(row_dict[k]) for k in row_dict.keys()]
+
+                    cur_merged.execute(
+                        f"""
+                        INSERT INTO no_inser_zeek ({", ".join(insert_cols)})
+                        VALUES ({placeholders})
+                        """,
+                        values
+                    )
+
+                processed += 1
+                if processed % 100 == 0:
+                    print(f"[DEBUG] conn: processati {processed} righe")
+
+            conn_merged.commit()
+            print(f"[DEBUG] conn: totale righe processate {processed}")
+
+
+        # ---------------- Tabelle rimanenti ----------------
+        print(f"[ZEEK] Elaborando tabella {table} (altre)")
+        conn_merged.execute("BEGIN")
+        processed = 0
+        for row in cur_zeek:
+            row_dict = dict(zip(colnames, row))
+            uids = []
+            if has_uid and row_dict.get("uid"):
+                uids = [row_dict["uid"]]
+            elif has_uids and row_dict.get("uids"):
+                uids = re.split(r'[;, ]+', str(row_dict["uids"]))
+            for uid in uids:
+                cur_merged.execute(
+                    'SELECT zeek_uid_list, zeek_json FROM interesse WHERE zeek_uid_list LIKE ?',
+                    (f'%{uid}%',)
+                )
+                r = cur_merged.fetchone()
+                if r:
+                    zeek_uid_list_json, zeek_json_str = r
+                    zeek_json_obj = json.loads(zeek_json_str) if zeek_json_str else {}
+                    zeek_json_obj[uid] = row_dict
+                    cur_merged.execute(
+                        'UPDATE interesse SET zeek_json=? WHERE zeek_uid_list LIKE ?',
+                        (json.dumps(zeek_json_obj, ensure_ascii=False), f'%{uid}%')
+                    )
+
+            processed += 1
+            if processed % 100 == 0:
+                print(f"[DEBUG] {table}: processati {processed} righe")
+                conn_merged.commit()
+        conn_merged.commit()
+        print(f"[DEBUG] {table}: totale righe processate {processed}")
+
+# -------------------- MAIN --------------------
+def run_once():
+    print("=== START MERGE ===")
+    if not os.path.exists(DB_NTOP) or not os.path.exists(DB_ZEEK):
+        raise RuntimeError("Database files not found")
+
+    conn_ntop = sqlite3.connect(DB_NTOP)
+    conn_zeek = sqlite3.connect(DB_ZEEK)
+    conn_merged = sqlite3.connect(DB_MERGED)
+
+    try:
+        optimize_sqlite(conn_ntop)
+        optimize_sqlite(conn_zeek)
+        optimize_sqlite(conn_merged)
+
+        build_interesse_table(conn_ntop, conn_merged)
+        process_ntop(conn_ntop, conn_merged)
+        process_zeek(conn_merged, conn_zeek)
+
+        print("[✓] MERGE COMPLETATO")
+    finally:
+        conn_ntop.close()
+        conn_zeek.close()
+        conn_merged.close()
+
+if __name__ == "__main__":
+    run_once()
