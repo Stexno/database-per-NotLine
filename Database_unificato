@@ -4,9 +4,9 @@ import os
 import re
 import json
 
-DB_NTOP = "percorso/database/ntopng.db"
-DB_ZEEK = "percorso/database/zeek.db"
-DB_MERGED = "percorso/database/di/creazione/di/merge.db"
+DB_NTOP = "path/ntopng.db"
+DB_ZEEK = "path/zeek.db"
+DB_MERGED = "path/merge.db"
 
 # -------------------- Helpers --------------------
 def safe_colname(name: str) -> str:
